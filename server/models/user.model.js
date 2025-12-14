@@ -21,6 +21,10 @@ const orderDataSchema = new mongoose.Schema({
   totalAmount: { type: Number, required: true },
   orderDate: { type: Date, default: Date.now },
   status: { type: String, default: "Pending" },
+  paymentStatus: { type: String, default: "unpaid" },
+  paymentProvider: { type: String },
+  paymentIntentId: { type: String },
+  stripeSessionId: { type: String },
   // whether product quantities from this order were returned to stock (e.g. when order was cancelled)
   restocked: { type: Boolean, default: false },
   // timestamp when restock occurred (if any)

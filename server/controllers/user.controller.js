@@ -243,6 +243,35 @@ export const createOrder = async (req, res) => {
       restocked: false,
     };
 
+    // Hydrate missing product fields (image/name/price) from DB to avoid placeholders in history
+    try {
+      const ids = orderRecord.products.map(p => p.productId).filter(Boolean)
+      if (ids.length > 0) {
+        const Product = await import("../models/product.model.js").then((m) => m.default).catch(() => null);
+        if (Product) {
+          const orQueries = ids.map(id => (/^[0-9a-fA-F]{24}$/.test(id) ? { _id: id } : { productId: Number(id) }));
+          const docs = await Product.find({ $or: orQueries }).lean()
+          const byKey = new Map()
+          docs.forEach(d => {
+            if (d?._id) byKey.set(String(d._id), d)
+            if (typeof d.productId !== 'undefined') byKey.set(String(d.productId), d)
+          })
+          orderRecord.products = orderRecord.products.map(p => {
+            const ref = byKey.get(String(p.productId))
+            return {
+              ...p,
+              name: p.name || ref?.name || '',
+              price: typeof p.price === 'number' ? p.price : Number(ref?.price || 0),
+              image: p.image || ref?.image || '/images/placeholder.png',
+            }
+          })
+        }
+      }
+    } catch (hydrateErr) {
+      console.error('order hydrate warning:', hydrateErr)
+      orderRecord.products = orderRecord.products.map(p => ({ ...p, image: p.image || '/images/placeholder.png' }))
+    }
+
     // Validate per-product caps and decrement stock atomically
     const Product = await import("../models/product.model.js").then((m) => m.default).catch(() => null);
     if (!Product) return res.status(500).json({ error: "Product model not available" });

@@ -807,6 +807,12 @@ export default function AdminPanel() {
                                   ${o.status === 'delivered' ? 'bg-green-100 text-green-800' : ''}
                                   ${o.status === 'canceled' ? 'bg-red-100 text-red-800 animate-bounce' : ''}
                                 `}>{o.status}</div>
+                                <div className={`inline-flex items-center px-2 py-1 rounded-full text-[11px] font-medium mr-2
+                                  ${String(o.paymentStatus || '').toLowerCase() === 'paid' ? 'bg-emerald-100 text-emerald-800' : 'bg-orange-100 text-orange-800'}
+                                `}>
+                                  {String(o.paymentStatus || 'unpaid').toLowerCase() === 'paid' ? 'Paid' : 'Unpaid'}
+                                  {o.paymentProvider ? ` • ${o.paymentProvider}` : ''}
+                                </div>
 
                                 <select
                                   value={o.status}

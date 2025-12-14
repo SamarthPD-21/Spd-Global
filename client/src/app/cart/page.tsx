@@ -3,6 +3,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import Image from 'next/image'
+import { useSearchParams } from 'next/navigation'
 import { useSelector, useDispatch } from 'react-redux'
 import { RootState } from '@/redux/store'
 import { getCurrentUser } from '@/lib/User'
@@ -10,6 +11,7 @@ import { setUser, updateCartQuantity, removeFromCart, restoreCartItem } from '@/
 import { toast as rtToast } from 'react-toastify'
 import { notify } from '@/lib/toast'
 import { REMOVE_ANIM_MS, UNDO_WINDOW_MS, SLIDE_IN_MS, TOAST_DELAY_MS } from '@/lib/cartTiming'
+import { loadStripe } from '@stripe/stripe-js'
 
 // --- Type Definitions ---
 interface CartItemMeta {
@@ -32,6 +34,7 @@ interface UserState {
 export default function CartPage() {
   const user = useSelector((state: RootState) => state.user) as UserState
   const dispatch = useDispatch()
+  const searchParams = useSearchParams()
 
   const refreshUser = async () => {
     try {
@@ -217,10 +220,12 @@ export default function CartPage() {
   }, [user])
 
   const itemCount = cartItems.length
+  const totalQuantity = cartItems.reduce((sum, item) => sum + Number(item.quantity || item.qty || 1), 0)
 
   // Local state for quantities
   const [localQuantities, setLocalQuantities] = useState<Record<string, number>>({})
   const [availableMap, setAvailableMap] = useState<Record<string, number>>({})
+  const handledStripeReturn = useRef(false)
 
   // ✅ Sync localQuantities whenever cartdata changes
   useEffect(() => {
@@ -289,6 +294,7 @@ export default function CartPage() {
   // Thanks popup visibility
   const [thanksVisible, setThanksVisible] = useState(false)
   const [checkoutLoading, setCheckoutLoading] = useState(false)
+  const [verifyingPayment, setVerifyingPayment] = useState(false)
 
   const updateQuantity = (pid: string, change: number) => {
     const currentQty = localQuantities[pid] || 1
@@ -332,6 +338,46 @@ export default function CartPage() {
     }, 220)
   }
 
+  const startStripeCheckout = async () => {
+    if (checkoutLoading) return
+    const publishableKey = process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY
+    if (!publishableKey) {
+      notify.error('Stripe publishable key missing')
+      return
+    }
+
+    setCheckoutLoading(true)
+    try {
+      const API = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000').replace(/\/$/, '')
+      const res = await fetch(`${API}/api/payments/checkout-session`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+      })
+      const json = await res.json().catch(() => ({})) as { sessionId?: string; url?: string; error?: string }
+      if (!res.ok) {
+        const msg = json?.error || 'Failed to start checkout'
+        notify.error(String(msg))
+        return
+      }
+
+      const stripe = await loadStripe(publishableKey)
+      if (stripe && json.sessionId) {
+        const result = await stripe.redirectToCheckout({ sessionId: json.sessionId })
+        if (result.error) notify.error(result.error.message || 'Stripe redirect failed')
+      } else if (json.url) {
+        window.location.href = json.url
+      } else {
+        notify.error('Unable to start Stripe checkout')
+      }
+    } catch (err) {
+      console.error('stripe checkout error', err)
+      notify.error('Checkout failed')
+    } finally {
+      setCheckoutLoading(false)
+    }
+  }
+
   
 
   // Calculate total price
@@ -360,6 +406,61 @@ export default function CartPage() {
     return () => clearTimeout(t)
   }, [totalPrice])
 
+  useEffect(() => {
+    if (!searchParams || handledStripeReturn.current) return
+    const status = searchParams.get('stripe')
+    const sessionId = searchParams.get('session_id')
+    const cleanupUrl = () => {
+      if (typeof window === 'undefined') return
+      const url = new URL(window.location.href)
+      url.searchParams.delete('stripe')
+      url.searchParams.delete('session_id')
+      url.searchParams.delete('order_id')
+      window.history.replaceState({}, '', url.pathname + (url.search ? `?${url.searchParams.toString()}` : '') + url.hash)
+    }
+
+    if (status === 'cancelled') {
+      handledStripeReturn.current = true
+      notify.info('Payment was cancelled')
+      cleanupUrl()
+      return
+    }
+
+    if (status === 'success' && sessionId) {
+      handledStripeReturn.current = true
+      const verifyPayment = async () => {
+        setVerifyingPayment(true)
+        try {
+          const API = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000').replace(/\/$/, '')
+          const res = await fetch(`${API}/api/payments/verify-session`, {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId }),
+          })
+          const json = await res.json().catch(() => ({})) as { error?: string }
+          if (!res.ok) {
+            const msg = json?.error || 'Could not verify payment'
+            notify.error(String(msg))
+            return
+          }
+
+          notify.success('Payment successful')
+          await refreshUser()
+          setThanksVisible(true)
+          window.setTimeout(() => setThanksVisible(false), 2400)
+        } catch (err) {
+          console.error('verify payment failed', err)
+          notify.error('Failed to verify payment')
+        } finally {
+          setVerifyingPayment(false)
+          cleanupUrl()
+        }
+      }
+      verifyPayment()
+    }
+  }, [searchParams, refreshUser])
+
   if (!user?.email)
     return (
       <div className="bg-veblyssBackground min-h-screen flex items-center justify-center">
@@ -379,6 +480,28 @@ export default function CartPage() {
       </section>
 
       <section className="container mx-auto px-4">
+        {cartItems.length > 0 && (
+          <div className="grid gap-3 md:grid-cols-3 mb-6">
+            <div className="md:col-span-2 bg-white/70 backdrop-blur rounded-xl border border-emerald-50 shadow-sm p-4 flex items-center gap-3">
+              <div className="h-10 w-10 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center font-semibold">₹</div>
+              <div className="flex-1">
+                <p className="font-semibold text-veblyssText">Secure payments with Stripe (INR)</p>
+                <p className="text-sm text-gray-600">Cards and wallets supported. We never store your card details.</p>
+              </div>
+              {(checkoutLoading || verifyingPayment) && (
+                <span className="text-sm text-emerald-700 animate-pulse">{verifyingPayment ? 'Verifying payment…' : 'Starting checkout…'}</span>
+              )}
+            </div>
+            <div className="bg-[#0f766e] text-white rounded-xl p-4 shadow-md flex flex-col gap-1">
+              <span className="text-sm uppercase tracking-wide opacity-80">Cart snapshot</span>
+              <div className="flex items-baseline gap-2">
+                <span className="text-3xl font-bold">{itemCount}</span>
+                <span className="text-sm opacity-90">items</span>
+              </div>
+              <p className="text-sm opacity-90">{totalQuantity} total pieces · ₹{totalPrice.toFixed(2)}</p>
+            </div>
+          </div>
+        )}
         {cartItems.length === 0 ? (
           <div className="bg-white rounded-xl p-12 text-center shadow-lg">
             <h2 className="font-playfair text-2xl mb-4">Your cart is empty</h2>
@@ -499,42 +622,11 @@ export default function CartPage() {
                 Total updated to ₹{totalPrice.toFixed(2)}
               </div>
               <button
-                onClick={async () => {
-                  if (checkoutLoading) return
-                  setCheckoutLoading(true)
-                  try {
-                    const API = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000').replace(/\/$/, '')
-                    const res = await fetch(`${API}/api/user/order/create`, {
-                      method: 'POST',
-                      credentials: 'include',
-                      headers: { 'Content-Type': 'application/json' },
-                      // no body required: server will use user's cart if omitted
-                    })
-                    const json = await res.json().catch(() => ({}))
-                    if (!res.ok) {
-                      const msg = (json && (json.error || json.message)) || 'Checkout failed'
-                      notify.error(String(msg))
-                      return
-                    }
-
-                    // refresh user from server to update cart/orderdata in Redux
-                    await refreshUser()
-
-                    // show success popup
-                    setThanksVisible(true)
-                    window.setTimeout(() => setThanksVisible(false), 2400)
-                    // optionally navigate to orders page in profile: left to developer
-                  } catch (err) {
-                    console.error('checkout failed', err)
-                    notify.error('Checkout failed')
-                  } finally {
-                    setCheckoutLoading(false)
-                  }
-                }}
-                disabled={checkoutLoading}
-                className={`mt-4 md:mt-0 px-6 py-3 rounded-xl font-bold bg-[#368581] text-[#FAF9F6] transition-transform hover:scale-105 duration-300 ${checkoutLoading ? 'opacity-70 pointer-events-none' : ''}`}
+                onClick={startStripeCheckout}
+                disabled={checkoutLoading || verifyingPayment || totalPrice <= 0}
+                className={`mt-4 md:mt-0 px-6 py-3 rounded-xl font-bold bg-[#368581] text-[#FAF9F6] transition-transform hover:scale-105 duration-300 ${checkoutLoading || verifyingPayment || totalPrice <= 0 ? 'opacity-70 pointer-events-none' : ''}`}
               >
-                {checkoutLoading ? 'Processing...' : 'Checkout'}
+                {checkoutLoading || verifyingPayment ? 'Processing...' : 'Pay with Stripe'}
               </button>
             </div>
           </>

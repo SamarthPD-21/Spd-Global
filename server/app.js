@@ -8,6 +8,7 @@ import adminRouter from './routes/admin.routes.js';
 import debugRouter from './routes/debug.routes.js';
 import productRouter from './routes/product.routes.js';
 import contactRouter from './routes/contact.routes.js';
+import paymentRouter from './routes/payment.routes.js';
 
 const app = express();
 
@@ -26,6 +27,7 @@ app.use('/api/admin', adminRouter);
 app.use('/api/products', productRouter);
 app.use('/api/debug', debugRouter);
 app.use('/api/contact', contactRouter);
+app.use('/api/payments', paymentRouter);
 
 // Error handler (must be after routes)
 app.use((err, req, res, next) => {
