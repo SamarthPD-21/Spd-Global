@@ -1,6 +1,6 @@
- 'use client'
+'use client'
 
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import Image from 'next/image'
 import { useSearchParams } from 'next/navigation'
@@ -31,10 +31,14 @@ interface UserState {
 }
 
 // --- Component ---
-export default function CartPage() {
+type CartPageInnerProps = { searchParams: ReturnType<typeof useSearchParams> }
+
+function CartPageInner({ searchParams }: CartPageInnerProps) {
+  const [hydrated, setHydrated] = useState(false)
+  useEffect(() => { setHydrated(true) }, [])
+
   const user = useSelector((state: RootState) => state.user) as UserState
   const dispatch = useDispatch()
-  const searchParams = useSearchParams()
 
   const refreshUser = async () => {
     try {
@@ -461,6 +465,14 @@ export default function CartPage() {
     }
   }, [searchParams, refreshUser])
 
+  if (!hydrated) {
+    return (
+      <div className="bg-veblyssBackground min-h-screen flex items-center justify-center text-veblyssText">
+        Loading cart…
+      </div>
+    )
+  }
+
   if (!user?.email)
     return (
       <div className="bg-veblyssBackground min-h-screen flex items-center justify-center">
@@ -659,5 +671,20 @@ export default function CartPage() {
   .animate-slide-out { animation: slideOut 220ms ease-in both; }
       `}</style>
     </div>
+  )
+}
+
+// Wrapper that isolates useSearchParams inside Suspense to avoid hook order changes
+function CartPageWithSearchParams() {
+  const searchParams = useSearchParams()
+  return <CartPageInner searchParams={searchParams} />
+}
+
+// Wrap in Suspense to satisfy Next.js requirement for useSearchParams
+export default function CartPage() {
+  return (
+    <Suspense fallback={<div className="min-h-screen flex items-center justify-center text-veblyssText">Loading cart…</div>}>
+      <CartPageWithSearchParams />
+    </Suspense>
   )
 }
