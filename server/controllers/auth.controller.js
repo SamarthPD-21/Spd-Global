@@ -55,7 +55,9 @@ export const signup = async (req, res) => {
       sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
       secure: process.env.NODE_ENV === "production", // 'none' requires secure in modern browsers
       maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+      path: '/', // ensure cookie is sent for ALL routes
     };
+    console.log('[auth] signup: setting cookie for user:', newUser.email, 'options:', JSON.stringify(cookieOptions));
     res.cookie("token", token, cookieOptions);
     // hide password
   const out = newUser.toObject();
@@ -100,7 +102,9 @@ export const signin = async (req, res) => {
       sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
       secure: process.env.NODE_ENV === "production", // require HTTPS in production
       maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+      path: '/', // ensure cookie is sent for ALL routes
     };
+    console.log('[auth] signin: setting cookie for user:', user.email, 'options:', JSON.stringify(cookieOptions));
 
     res.cookie("token", token, cookieOptions);
 

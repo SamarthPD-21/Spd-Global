@@ -346,6 +346,7 @@ function CartPageInner({ searchParams }: CartPageInnerProps) {
     if (checkoutLoading) return
     const publishableKey = process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY
     if (!publishableKey) {
+      console.error('[checkout] NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY is not set!')
       notify.error('Stripe publishable key missing')
       return
     }
@@ -353,29 +354,44 @@ function CartPageInner({ searchParams }: CartPageInnerProps) {
     setCheckoutLoading(true)
     try {
       const API = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000').replace(/\/$/, '')
+      console.log('[checkout] Starting checkout, API:', API)
       const res = await fetch(`${API}/api/payments/checkout-session`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
       })
-      const json = await res.json().catch(() => ({})) as { sessionId?: string; url?: string; error?: string }
+      console.log('[checkout] checkout-session response status:', res.status)
+      const json = await res.json().catch(() => ({})) as { sessionId?: string; url?: string; error?: string; message?: string; reason?: string }
+      console.log('[checkout] checkout-session response body:', JSON.stringify(json))
       if (!res.ok) {
-        const msg = json?.error || 'Failed to start checkout'
-        notify.error(String(msg))
+        // If we got a 401, it's an auth issue — tell the user clearly
+        if (res.status === 401) {
+          console.error('[checkout] Auth failed — cookie may be missing or expired. reason:', json?.reason)
+          notify.error('Session expired. Please log in again.')
+        } else {
+          const msg = json?.error || json?.message || 'Failed to start checkout'
+          notify.error(String(msg))
+        }
         return
       }
 
       const stripe = await loadStripe(publishableKey)
       if (stripe && json.sessionId) {
+        console.log('[checkout] Redirecting to Stripe checkout, sessionId:', json.sessionId)
         const result = await stripe.redirectToCheckout({ sessionId: json.sessionId })
-        if (result.error) notify.error(result.error.message || 'Stripe redirect failed')
+        if (result.error) {
+          console.error('[checkout] Stripe redirect error:', result.error)
+          notify.error(result.error.message || 'Stripe redirect failed')
+        }
       } else if (json.url) {
+        console.log('[checkout] Redirecting to Stripe URL:', json.url)
         window.location.href = json.url
       } else {
+        console.error('[checkout] No sessionId or url in response:', json)
         notify.error('Unable to start Stripe checkout')
       }
     } catch (err) {
-      console.error('stripe checkout error', err)
+      console.error('[checkout] stripe checkout error:', err)
       notify.error('Checkout failed')
     } finally {
       setCheckoutLoading(false)
@@ -425,6 +441,7 @@ function CartPageInner({ searchParams }: CartPageInnerProps) {
 
     if (status === 'cancelled') {
       handledStripeReturn.current = true
+      console.log('[checkout] Payment cancelled by user')
       notify.info('Payment was cancelled')
       cleanupUrl()
       return
@@ -432,30 +449,51 @@ function CartPageInner({ searchParams }: CartPageInnerProps) {
 
     if (status === 'success' && sessionId) {
       handledStripeReturn.current = true
-      const verifyPayment = async () => {
+      console.log('[checkout] Stripe returned success, sessionId:', sessionId)
+
+      const verifyPayment = async (retries = 3) => {
         setVerifyingPayment(true)
         try {
           const API = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000').replace(/\/$/, '')
+          console.log('[checkout] Verifying payment, sessionId:', sessionId, '| attempt:', 4 - retries)
           const res = await fetch(`${API}/api/payments/verify-session`, {
             method: 'POST',
             credentials: 'include',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ sessionId }),
           })
-          const json = await res.json().catch(() => ({})) as { error?: string }
+          console.log('[checkout] verify-session response status:', res.status)
+          const json = await res.json().catch(() => ({})) as { error?: string; retryable?: boolean; reason?: string; message?: string; payment_status?: string }
+          console.log('[checkout] verify-session response body:', JSON.stringify(json))
+
           if (!res.ok) {
-            const msg = json?.error || 'Could not verify payment'
-            notify.error(String(msg))
+            // If payment status is pending and we have retries left, wait and retry
+            if (json?.retryable && retries > 1) {
+              console.log('[checkout] Payment not confirmed yet (status:', json.payment_status, '), retrying in 2s... retries left:', retries - 1)
+              notify.info('Waiting for payment confirmation...')
+              await new Promise(resolve => setTimeout(resolve, 2000))
+              return verifyPayment(retries - 1)
+            }
+
+            if (res.status === 401) {
+              console.error('[checkout] Auth failed during verify — cookie may be missing. reason:', json?.reason)
+              notify.error('Session expired. Please log in and check your orders — your payment may have succeeded.')
+            } else {
+              const msg = json?.error || json?.message || 'Could not verify payment'
+              console.error('[checkout] Verify failed:', msg)
+              notify.error(String(msg))
+            }
             return
           }
 
+          console.log('[checkout] Payment verified successfully!')
           notify.success('Payment successful')
           await refreshUser()
           setThanksVisible(true)
           window.setTimeout(() => setThanksVisible(false), 2400)
         } catch (err) {
-          console.error('verify payment failed', err)
-          notify.error('Failed to verify payment')
+          console.error('[checkout] verify payment exception:', err)
+          notify.error('Failed to verify payment — check your orders page')
         } finally {
           setVerifyingPayment(false)
           cleanupUrl()
@@ -463,7 +501,8 @@ function CartPageInner({ searchParams }: CartPageInnerProps) {
       }
       verifyPayment()
     }
-  }, [searchParams, refreshUser])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams])
 
   if (!hydrated) {
     return (

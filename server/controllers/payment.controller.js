@@ -40,32 +40,51 @@ const buildCompactSnapshot = (cartItems) => {
 }
 
 export const createCheckoutSession = async (req, res) => {
+  console.log('[payment] createCheckoutSession called, userId:', req.userId)
   const stripe = getStripe()
-  if (!stripe) return res.status(500).json({ error: 'Stripe secret key missing' })
+  if (!stripe) {
+    console.error('[payment] STRIPE_SECRET_KEY is not set!')
+    return res.status(500).json({ error: 'Stripe secret key missing' })
+  }
 
   try {
     const userId = req.userId
     const user = await User.findById(userId)
-    if (!user) return res.status(404).json({ error: 'User not found' })
+    if (!user) {
+      console.warn('[payment] User not found for id:', userId)
+      return res.status(404).json({ error: 'User not found' })
+    }
+    console.log('[payment] User found:', user.email, '| raw cartdata length:', (user.cartdata || []).length)
 
     const cartItems = sanitizeCartItems(user.cartdata)
+    console.log('[payment] Sanitized cart items:', cartItems.length, JSON.stringify(cartItems.map(i => ({ id: i.productId, name: i.name, price: i.price, qty: i.quantity }))))
     if (cartItems.length === 0) return res.status(400).json({ error: 'Cart is empty' })
 
+    // Build line items — skip images entirely to avoid Stripe URL validation errors
+    // (Stripe rejects relative paths and non-HTTPS URLs)
     const lineItems = cartItems.map((item) => {
       const unitAmount = Math.max(0, Math.round(Number(item.price || 0) * 100))
-      if (unitAmount <= 0) throw new Error('Invalid item price for Stripe checkout')
+      if (unitAmount <= 0) {
+        console.error('[payment] Item has invalid price:', item.name, 'price:', item.price, 'unitAmount:', unitAmount)
+        throw new Error(`Invalid item price for "${item.name}" (price=${item.price})`)
+      }
+
+      // Only include image if it's an absolute HTTPS URL (Stripe requires this)
+      const imageUrl = item.image && /^https:\/\//i.test(item.image) ? item.image : undefined
+
       return {
         price_data: {
           currency: 'inr',
           product_data: {
             name: item.name || 'Product',
-            images: item.image ? [item.image] : undefined,
+            images: imageUrl ? [imageUrl] : undefined,
           },
           unit_amount: unitAmount,
         },
         quantity: Math.max(1, Number(item.quantity || 1)),
       }
     })
+    console.log('[payment] Line items built:', lineItems.length, '| first unit_amount:', lineItems[0]?.price_data?.unit_amount)
 
     const totalAmount = cartItems.reduce((sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 1), 0)
     const orderId = `STR-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
@@ -73,8 +92,10 @@ export const createCheckoutSession = async (req, res) => {
     const clientUrl = (process.env.CLIENT_URL || 'http://localhost:3000').replace(/\/$/, '')
     const successUrl = `${clientUrl}/cart?stripe=success&session_id={CHECKOUT_SESSION_ID}&order_id=${orderId}`
     const cancelUrl = `${clientUrl}/cart?stripe=cancelled`
+    console.log('[payment] successUrl:', successUrl)
+    console.log('[payment] cancelUrl:', cancelUrl)
 
-    const session = await stripe.checkout.sessions.create({
+    const sessionParams = {
       mode: 'payment',
       payment_method_types: ['card'],
       customer_email: user.email || undefined,
@@ -87,41 +108,72 @@ export const createCheckoutSession = async (req, res) => {
         totalAmount: String(totalAmount),
         cartSnapshot: buildCompactSnapshot(cartItems),
       },
-    })
+    }
+    console.log('[payment] Creating Stripe session with params:', JSON.stringify({ ...sessionParams, line_items: `[${lineItems.length} items]` }))
+
+    const session = await stripe.checkout.sessions.create(sessionParams)
+    console.log('[payment] Stripe session created successfully:', session.id, '| url:', session.url)
 
     return res.status(200).json({ sessionId: session.id, url: session.url })
   } catch (err) {
-    console.error('createCheckoutSession error:', err)
+    console.error('[payment] createCheckoutSession FAILED:', err?.type || '', err?.message || err)
+    if (err?.raw) console.error('[payment] Stripe raw error:', JSON.stringify(err.raw))
     return res.status(500).json({ error: err?.message || 'Failed to create Stripe session' })
   }
 }
 
 export const verifyCheckoutSession = async (req, res) => {
+  console.log('[payment] verifyCheckoutSession called, userId:', req.userId)
   const stripe = getStripe()
-  if (!stripe) return res.status(500).json({ error: 'Stripe secret key missing' })
+  if (!stripe) {
+    console.error('[payment] STRIPE_SECRET_KEY is not set!')
+    return res.status(500).json({ error: 'Stripe secret key missing' })
+  }
 
   const { sessionId } = req.body || {}
+  console.log('[payment] verify sessionId:', sessionId)
   if (!sessionId) return res.status(400).json({ error: 'sessionId required' })
 
   try {
     const session = await stripe.checkout.sessions.retrieve(sessionId)
-    if (!session) return res.status(404).json({ error: 'Session not found' })
+    if (!session) {
+      console.warn('[payment] Session not found for id:', sessionId)
+      return res.status(404).json({ error: 'Session not found' })
+    }
+    console.log('[payment] Session retrieved:', {
+      id: session.id,
+      payment_status: session.payment_status,
+      status: session.status,
+      metadataUserId: session.metadata?.userId,
+      amount_total: session.amount_total,
+    })
 
     const sessionUserId = session.metadata?.userId
     if (!sessionUserId || String(sessionUserId) !== String(req.userId)) {
+      console.warn('[payment] userId mismatch: session.metadata.userId=', sessionUserId, 'req.userId=', req.userId)
       return res.status(403).json({ error: 'Session does not belong to this user' })
     }
 
     if (session.payment_status !== 'paid') {
-      return res.status(400).json({ error: 'Payment not completed yet' })
+      console.warn('[payment] Payment not completed. payment_status:', session.payment_status, '| status:', session.status)
+      // Return a retryable status so the client can poll
+      return res.status(402).json({
+        error: 'Payment not completed yet',
+        payment_status: session.payment_status,
+        retryable: true,
+      })
     }
 
     const user = await User.findById(req.userId)
-    if (!user) return res.status(404).json({ error: 'User not found' })
+    if (!user) {
+      console.warn('[payment] User not found for verify, id:', req.userId)
+      return res.status(404).json({ error: 'User not found' })
+    }
 
     const orderId = session.metadata?.orderId || `STR-${session.id}`
     const existing = (user.orderdata || []).find((o) => o.orderId === orderId || o.stripeSessionId === session.id)
     if (existing) {
+      console.log('[payment] Order already exists, returning existing:', orderId)
       return res.status(200).json({ order: existing, user: await User.findById(req.userId).select('-password') })
     }
 
@@ -129,9 +181,10 @@ export const verifyCheckoutSession = async (req, res) => {
     try {
       snapshot = sanitizeCartItems(JSON.parse(session.metadata?.cartSnapshot || '[]'))
     } catch (parseErr) {
-      console.warn('Failed to parse cartSnapshot metadata', parseErr)
+      console.warn('[payment] Failed to parse cartSnapshot metadata', parseErr)
     }
     const products = snapshot.length > 0 ? snapshot : sanitizeCartItems(user.cartdata)
+    console.log('[payment] Products for order:', products.length, '(from', snapshot.length > 0 ? 'snapshot' : 'user cart', ')')
     if (products.length === 0) return res.status(400).json({ error: 'No products to create order' })
 
     // Reserve stock just like createOrder does
@@ -139,7 +192,10 @@ export const verifyCheckoutSession = async (req, res) => {
     try {
       for (const p of products) {
         const qty = Number(p.quantity || 0)
-        if (qty > 5) return res.status(400).json({ error: `Cannot order more than 5 units of ${p.name}` })
+        if (qty > 5) {
+          console.warn('[payment] Quantity cap exceeded for', p.name, 'qty:', qty)
+          return res.status(400).json({ error: `Cannot order more than 5 units of ${p.name}` })
+        }
 
         let query = null
         if (p.productId && String(p.productId).match(/^[0-9a-fA-F]{24}$/)) {
@@ -149,9 +205,13 @@ export const verifyCheckoutSession = async (req, res) => {
         } else {
           query = { _id: p.productId }
         }
+        console.log('[payment] Reserving stock for:', p.name, 'qty:', qty, 'query:', JSON.stringify(query))
 
         const updated = await Product.findOneAndUpdate({ $and: [query, { quantity: { $gte: qty } }] }, { $inc: { quantity: -qty } }, { new: true }).lean()
-        if (!updated) return res.status(400).json({ error: `Insufficient stock for product ${p.name}` })
+        if (!updated) {
+          console.warn('[payment] Insufficient stock for product:', p.name, 'productId:', p.productId)
+          return res.status(400).json({ error: `Insufficient stock for product ${p.name}` })
+        }
         // hydrate missing image/name from product doc to satisfy schema requirements
         p.image = p.image || updated.image || '/images/placeholder.png'
         p.name = p.name || updated.name || 'Product'
@@ -164,9 +224,9 @@ export const verifyCheckoutSession = async (req, res) => {
           await Product.findByIdAndUpdate(up._id, { $inc: { quantity: up.qty } })
         }
       } catch (rbErr) {
-        console.error('rollback failed after stock error', rbErr)
+        console.error('[payment] Rollback failed after stock error', rbErr)
       }
-      console.error('stock reservation failed', stockErr)
+      console.error('[payment] Stock reservation failed', stockErr)
       return res.status(500).json({ error: 'Failed to reserve stock' })
     }
 
@@ -189,11 +249,13 @@ export const verifyCheckoutSession = async (req, res) => {
     user.orderdata.push(orderRecord)
     user.cartdata = []
     await user.save()
+    console.log('[payment] Order saved successfully:', orderId, '| cart cleared')
 
     const safeUser = await User.findById(req.userId).select('-password')
     return res.status(201).json({ order: orderRecord, user: safeUser })
   } catch (err) {
-    console.error('verifyCheckoutSession error:', err)
+    console.error('[payment] verifyCheckoutSession FAILED:', err?.type || '', err?.message || err)
+    if (err?.raw) console.error('[payment] Stripe raw error:', JSON.stringify(err.raw))
     return res.status(500).json({ error: err?.message || 'Failed to verify session' })
   }
 }
